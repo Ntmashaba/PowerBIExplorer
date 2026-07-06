@@ -358,16 +358,25 @@ def main():
               f"{inv['tables_referenced']} tables referenced")
 
     # ---- usage rollups -----------------------------------------------------
-    direct_use = defaultdict(set)            # table -> {reports}
-    measure_use = defaultdict(set)           # measure -> {reports}
-    unknown_entities = defaultdict(set)      # entity not in model -> {reports}
+    multi_report = len({r["report"] for r in all_rows}) > 1
+
+    def page_label(r):
+        """Attribution unit = the page. Report-scoped refs (report-level
+        filters, bookmarks, extensions) get a pseudo-page label."""
+        page = r["page"] or f"({r['context']})"
+        return f"{r['report']} / {page}" if multi_report else page
+
+    direct_use = defaultdict(set)            # table -> {pages}
+    measure_use = defaultdict(set)           # measure -> {pages}
+    unknown_entities = defaultdict(set)      # entity not in model -> {pages}
     for r in all_rows:
+        lbl = page_label(r)
         if r["table"] in table_names:
-            direct_use[r["table"]].add(r["report"])
+            direct_use[r["table"]].add(lbl)
         else:
-            unknown_entities[r["table"]].add(r["report"])
+            unknown_entities[r["table"]].add(lbl)
         if r["field_kind"] == "Measure" and r["field"] in measure_index:
-            measure_use[r["field"]].add(r["report"])
+            measure_use[r["field"]].add(lbl)
 
     # indirect via measures used in reports
     dax_cache = {}
@@ -400,12 +409,15 @@ def main():
             cls = "Possibly used - related to used table"
         else:
             cls = "UNUSED"
-        reps = sorted(direct_use.get(tname, set()) | via_measure.get(tname, set()))
+        pages_d = sorted(direct_use.get(tname, set()))
+        pages_m = sorted(via_measure.get(tname, set()))
         summary.append({
             "table": tname, "classification": cls, "is_hidden": t["isHidden"],
             "n_columns": t["n_columns"], "n_measures": len(t["measures"]),
             "is_calculated_table": bool(t["calc_table_expression"]),
-            "report_count": len(reps), "reports": "; ".join(reps),
+            "pages_direct_count": len(pages_d), "pages_direct": "; ".join(pages_d),
+            "pages_via_measure_count": len(pages_m),
+            "pages_via_measure": "; ".join(pages_m),
             "related_used_tables": "; ".join(sorted(via_rel.get(tname, set()))),
         })
     write_csv(out_dir / "table_usage_summary.csv", summary, list(summary[0].keys()))
@@ -420,9 +432,9 @@ def main():
     for mname in sorted(measure_index):
         info = measure_index[mname]
         deps = sorted(resolve_measure_tables(mname, measure_index, table_names, dax_cache))
-        reps = sorted(measure_use.get(mname, set()))
+        pgs = sorted(measure_use.get(mname, set()))
         mrows.append({"measure": mname, "home_table": info["table"],
-                      "used_in_report_count": len(reps), "reports": "; ".join(reps),
+                      "used_on_page_count": len(pgs), "pages": "; ".join(pgs),
                       "tables_referenced_in_dax": "; ".join(deps),
                       "expression": info["expression"]})
     if mrows:
@@ -471,8 +483,8 @@ def main():
     if unknown_entities:
         print("\n[warn] Entities referenced in reports but NOT found in the model "
               "(different model, renamed table, or report-scope table?):")
-        for e, reps in sorted(unknown_entities.items()):
-            print(f"  - {e}  (in: {', '.join(sorted(reps))})")
+        for e, pgs in sorted(unknown_entities.items()):
+            print(f"  - {e}  (on: {', '.join(sorted(pgs))})")
 
 
 if __name__ == "__main__":
