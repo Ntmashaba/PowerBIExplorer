@@ -68,19 +68,42 @@ def load_model(model_path: Path) -> dict:
                     "name": c.get("name", ""),
                     "expression": _expr_to_str(c.get("expression")),
                 })
-        # calculated table? (partition source type == calculated)
+        # partitions (the actual data sources) + calculated-table detection
         calc_table_expr = ""
+        partitions = []
         for p in t.get("partitions", []):
             src = p.get("source", {})
-            if src.get("type") == "calculated":
-                calc_table_expr = _expr_to_str(src.get("expression"))
-                break
+            ptype = src.get("type", "m" if src.get("expression") else "")
+            expr = _expr_to_str(src.get("expression")) or _expr_to_str(src.get("query"))
+            if ptype == "calculated" and not calc_table_expr:
+                calc_table_expr = expr
+            partitions.append({
+                "name": p.get("name", ""),
+                "mode": p.get("mode", "import"),
+                "type": ptype,
+                "expression": expr,
+                "dataSource": src.get("dataSource", ""),
+                "entityName": src.get("entityName", ""),
+                "schemaName": src.get("schemaName", ""),
+            })
         tables[name] = {
             "isHidden": bool(t.get("isHidden", False)),
             "measures": measures,
             "calc_columns": calc_columns,
             "calc_table_expression": calc_table_expr,
+            "partitions": partitions,
             "n_columns": len(t.get("columns", [])),
+        }
+
+    # legacy provider datasources (used by partition source type "query")
+    datasources = {}
+    for ds in model.get("dataSources", []):
+        cs = ds.get("connectionString", "")
+        server = re.search(r"(?:data source|server)\s*=\s*([^;]+)", cs, re.I)
+        db = re.search(r"(?:initial catalog|database)\s*=\s*([^;]+)", cs, re.I)
+        datasources[ds.get("name", "")] = {
+            "server": server.group(1).strip() if server else "",
+            "database": db.group(1).strip() if db else "",
         }
 
     relationships = []
@@ -95,7 +118,8 @@ def load_model(model_path: Path) -> dict:
             "crossFilteringBehavior": r.get("crossFilteringBehavior", "oneDirection"),
         })
 
-    return {"tables": tables, "relationships": relationships}
+    return {"tables": tables, "relationships": relationships,
+            "datasources": datasources}
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +183,87 @@ def resolve_measure_tables(measure_name, measure_index, table_names, cache, stac
 
 
 # ---------------------------------------------------------------------------
-# PBIR report scanning
+# Partition source analysis
 # ---------------------------------------------------------------------------
+
+def _sql_objects(sql: str):
+    """Extract table/view names from FROM and JOIN clauses of a SQL string."""
+    objs = re.findall(r"(?:FROM|JOIN)\s+([\w\[\]\.\"]+)", sql, re.I)
+    return sorted({o.strip('"') for o in objs if o.upper() != "SELECT"})
+
+
+def analyze_partition(part: dict, datasources: dict) -> dict:
+    """
+    Classify a partition's source and pull out server / database / source
+    objects. Binary (enter-data) payloads are flagged but not decoded.
+    """
+    out = {"source_kind": "", "server": "", "database": "",
+           "source_objects": "", "note": ""}
+    expr = part["expression"]
+    ptype = part["type"]
+
+    if ptype == "calculated":
+        out["source_kind"] = "Calculated table (DAX)"
+        out["note"] = expr[:200]
+        return out
+
+    if ptype == "entity":
+        out["source_kind"] = "Dataflow / entity"
+        obj = part["entityName"]
+        if part["schemaName"]:
+            obj = f"{part['schemaName']}.{obj}"
+        out["source_objects"] = obj
+        return out
+
+    if ptype == "query":  # legacy provider partition
+        ds = datasources.get(part["dataSource"], {})
+        out["source_kind"] = "Legacy SQL query"
+        out["server"], out["database"] = ds.get("server", ""), ds.get("database", "")
+        out["source_objects"] = "; ".join(_sql_objects(expr))
+        return out
+
+    # --- M expression partitions -------------------------------------------
+    if "Binary.Decompress" in expr or "Binary.FromText" in expr:
+        out["source_kind"] = "Embedded binary (enter-data)"
+        out["note"] = "Opaque binary payload stored in the model - details omitted"
+        return out
+
+    m = re.search(r'Sql\.Databases?\(\s*"([^"]+)"(?:\s*,\s*"([^"]+)")?', expr)
+    if m:
+        out["source_kind"] = "SQL Server (M)"
+        out["server"], out["database"] = m.group(1), m.group(2) or ""
+    else:
+        m = re.search(r'AnalysisServices\.Databases?\(\s*"([^"]+)"(?:\s*,\s*"([^"]+)")?', expr)
+        if m:
+            out["source_kind"] = "Analysis Services (M)"
+            out["server"], out["database"] = m.group(1), m.group(2) or ""
+        else:
+            m = re.search(r'(\w[\w.]*)\.(?:Database|Databases|Contents|Catalogs|Workspaces)\(\s*"([^"]*)"', expr)
+            if m:
+                out["source_kind"] = f"{m.group(1)} (M)"
+                out["server"] = m.group(2)
+            elif expr:
+                out["source_kind"] = "M query (unrecognized connector)"
+
+    # database picked via navigation: [Name="DW"] on a Databases() list
+    if out["server"] and not out["database"]:
+        nav = re.search(r'\[\s*Name\s*=\s*"([^"]+)"\s*\]', expr)
+        if nav:
+            out["database"] = nav.group(1)
+
+    objs = set()
+    for sm in re.finditer(r'(?:Schema\s*=\s*"([^"]+)"\s*,\s*)?Item\s*=\s*"([^"]+)"', expr):
+        objs.add(f"{sm.group(1)}.{sm.group(2)}" if sm.group(1) else sm.group(2))
+    # native SQL embedded in the M ([Query="..."] or Value.NativeQuery)
+    for qm in re.finditer(r'"(\s*(?:SELECT|WITH)\b[^"]+)"', expr, re.I):
+        objs.update(_sql_objects(qm.group(1)))
+        if "native SQL" not in out["note"]:
+            out["note"] = (out["note"] + " contains native SQL").strip()
+    out["source_objects"] = "; ".join(sorted(objs))
+    return out
+
+
+
 
 FIELD_KINDS = ("Column", "Measure", "Hierarchy", "HierarchyLevel",
                "Aggregation", "NativeVisualCalculation")
@@ -457,7 +560,26 @@ def main():
     if crows:
         write_csv(out_dir / "calculated_columns.csv", crows, list(crows[0].keys()))
 
-    # ---- CSV 5: relationships -------------------------------------------------
+    # ---- CSV 5: partitions (source-level lineage) -------------------------------
+    prows = []
+    for tname in sorted(table_names):
+        pages_d = direct_use.get(tname, set())
+        pages_m = via_measure.get(tname, set())
+        for part in model["tables"][tname]["partitions"]:
+            info = analyze_partition(part, model["datasources"])
+            prows.append({
+                "table": tname, "partition": part["name"], "mode": part["mode"],
+                "source_kind": info["source_kind"], "server": info["server"],
+                "database": info["database"],
+                "source_objects": info["source_objects"],
+                "pages_direct": "; ".join(sorted(pages_d)),
+                "pages_via_measure": "; ".join(sorted(pages_m)),
+                "note": info["note"],
+            })
+    if prows:
+        write_csv(out_dir / "partitions.csv", prows, list(prows[0].keys()))
+
+    # ---- CSV 6: relationships -------------------------------------------------
     rrows = []
     for rel in model["relationships"]:
         rrows.append({
