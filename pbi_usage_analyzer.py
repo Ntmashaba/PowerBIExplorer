@@ -561,23 +561,36 @@ def main():
         write_csv(out_dir / "calculated_columns.csv", crows, list(crows[0].keys()))
 
     # ---- CSV 5: partitions (source-level lineage) -------------------------------
+    # one row per partition per page, so the file is filter/pivot friendly
     prows = []
     for tname in sorted(table_names):
         pages_d = direct_use.get(tname, set())
         pages_m = via_measure.get(tname, set())
+        all_pages = sorted(pages_d | pages_m)
         for part in model["tables"][tname]["partitions"]:
             info = analyze_partition(part, model["datasources"])
-            prows.append({
+            base = {
                 "table": tname, "partition": part["name"], "mode": part["mode"],
                 "source_kind": info["source_kind"], "server": info["server"],
                 "database": info["database"],
                 "source_objects": info["source_objects"],
-                "pages_direct": "; ".join(sorted(pages_d)),
-                "pages_via_measure": "; ".join(sorted(pages_m)),
                 "note": info["note"],
-            })
+            }
+            if not all_pages:
+                prows.append({**base, "page": "", "usage_type": "not used on any page"})
+                continue
+            for page in all_pages:
+                if page in pages_d and page in pages_m:
+                    usage = "direct + via measure"
+                elif page in pages_d:
+                    usage = "direct"
+                else:
+                    usage = "via measure"
+                prows.append({**base, "page": page, "usage_type": usage})
     if prows:
-        write_csv(out_dir / "partitions.csv", prows, list(prows[0].keys()))
+        fields = ["table", "partition", "page", "usage_type", "mode", "source_kind",
+                  "server", "database", "source_objects", "note"]
+        write_csv(out_dir / "partitions.csv", prows, fields)
 
     # ---- CSV 6: relationships -------------------------------------------------
     rrows = []
